@@ -1,0 +1,565 @@
+/* 
+ * Exercise 3: WAN Security Integration and Attack Simulation
+ * NS-3 Implementation
+ * 
+ * Compile: ./waf --run "wan-security-exercise"
+ */
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/flow-monitor-module.h"
+#include "ns3/traffic-control-module.h"
+#include <fstream>
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("WanSecurityExercise");
+
+// Global variables for statistics
+uint32_t packetsSniffed = 0;
+uint32_t legitimatePacketsSent = 0;
+uint32_t legitimatePacketsReceived = 0;
+
+// ==================== 1. IPsec Simulation Class ====================
+class IpsecSimulator {
+public:
+    static void EncryptPacket(Ptr<Packet> packet) {
+        // Simulate encryption overhead by adding extra bytes (IPsec header)
+        // ESP header = 8 bytes, IV = 16 bytes, Padding = up to 15 bytes
+        uint32_t overhead = 39; // Average overhead
+        packet->AddPaddingAtEnd(overhead);
+    }
+    
+    static void AddProcessingDelay(Ptr<Node> node) {
+        // Simulate encryption/decryption processing delay (2-5ms)
+        Simulator::Schedule(MilliSeconds(3), &DoNothing);
+    }
+    
+private:
+    static void DoNothing() {}
+};
+
+// Custom application for IPsec-enabled traffic
+class IpsecApplication : public Application {
+public:
+    IpsecApplication() : m_socket(0), m_peer(), m_packetSize(1024), 
+                          m_nPackets(100), m_dataRate(DataRate("1Mbps")),
+                          m_sendEvent(), m_running(false), m_packetsSent(0),
+                          m_useIpsec(true) {}
+    
+    virtual ~IpsecApplication() { m_socket = 0; }
+    
+    void Setup(Address address, uint32_t packetSize, uint32_t nPackets,
+               DataRate dataRate, bool useIpsec) {
+        m_peer = address;
+        m_packetSize = packetSize;
+        m_nPackets = nPackets;
+        m_dataRate = dataRate;
+        m_useIpsec = useIpsec;
+    }
+    
+private:
+    virtual void StartApplication() {
+        m_running = true;
+        m_packetsSent = 0;
+        m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        m_socket->Bind();
+        m_socket->Connect(m_peer);
+        SendPacket();
+    }
+    
+    virtual void StopApplication() {
+        m_running = false;
+        if (m_sendEvent.IsRunning()) {
+            Simulator::Cancel(m_sendEvent);
+        }
+        if (m_socket) {
+            m_socket->Close();
+        }
+    }
+    
+    void SendPacket() {
+        Ptr<Packet> packet = Create<Packet>(m_packetSize);
+        
+        if (m_useIpsec) {
+            // Add IPsec overhead and processing delay
+            IpsecSimulator::EncryptPacket(packet);
+            IpsecSimulator::AddProcessingDelay(GetNode());
+        }
+        
+        m_socket->Send(packet);
+        legitimatePacketsSent++;
+        
+        if (++m_packetsSent < m_nPackets) {
+            ScheduleTransmit(Seconds(m_packetSize * 8 / 
+                            static_cast<double>(m_dataRate.GetBitRate())));
+        }
+    }
+    
+    void ScheduleTransmit(Time dt) {
+        if (m_running) {
+            m_sendEvent = Simulator::Schedule(dt, &IpsecApplication::SendPacket, this);
+        }
+    }
+    
+    Ptr<Socket> m_socket;
+    Address m_peer;
+    uint32_t m_packetSize;
+    uint32_t m_nPackets;
+    DataRate m_dataRate;
+    EventId m_sendEvent;
+    bool m_running;
+    uint32_t m_packetsSent;
+    bool m_useIpsec;
+};
+
+// ==================== 2. Eavesdropping Attack Simulation ====================
+void PacketSnifferCallback(std::string context, Ptr<const Packet> packet,
+                          const Address &address) {
+    packetsSniffed++;
+    
+    // Extract and log packet data (simulating eavesdropping)
+    uint8_t buffer[2048];
+    packet->CopyData(buffer, packet->GetSize());
+    
+    // In real scenario, attacker would analyze packet contents
+    // With IPsec, payload would be encrypted and unreadable
+    NS_LOG_INFO("ATTACKER: Sniffed packet of size " << packet->GetSize() 
+                << " bytes at " << Simulator::Now().GetSeconds() << "s");
+}
+
+void SetupEavesdropping(Ptr<Node> attackerNode, Ptr<NetDevice> wanDevice) {
+    // Enable promiscuous mode on attacker's network device
+    Ptr<PointToPointNetDevice> p2pDevice = 
+        DynamicCast<PointToPointNetDevice>(wanDevice);
+    if (p2pDevice) {
+        p2pDevice->SetReceiveCallback(MakeCallback(&PacketSnifferCallback));
+    }
+    
+    // Set device to promiscuous mode
+    wanDevice->SetPromiscuousReceiveCallback(
+        MakeCallback(&PacketSnifferCallback));
+}
+
+// ==================== 3. DDoS Attack Simulation ====================
+class DDoSAttacker : public Application {
+public:
+    DDoSAttacker() : m_socket(0), m_peer(), m_packetSize(512), 
+                     m_attackRate(DataRate("10Mbps")), m_running(false) {}
+    
+    void Setup(Address address, uint32_t packetSize, DataRate rate, 
+               std::string attackType) {
+        m_peer = address;
+        m_packetSize = packetSize;
+        m_attackRate = rate;
+        m_attackType = attackType;
+    }
+    
+private:
+    virtual void StartApplication() {
+        m_running = true;
+        
+        if (m_attackType == "UDP_FLOOD") {
+            m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        } else if (m_attackType == "SYN_FLOOD") {
+            m_socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+        }
+        
+        m_socket->Bind();
+        m_socket->Connect(m_peer);
+        SendAttackPacket();
+    }
+    
+    virtual void StopApplication() {
+        m_running = false;
+        if (m_socket) {
+            m_socket->Close();
+        }
+    }
+    
+    void SendAttackPacket() {
+        if (!m_running) return;
+        
+        Ptr<Packet> packet = Create<Packet>(m_packetSize);
+        m_socket->Send(packet);
+        
+        // Schedule next packet
+        Time interval = Seconds(m_packetSize * 8 / 
+                               static_cast<double>(m_attackRate.GetBitRate()));
+        Simulator::Schedule(interval, &DDoSAttacker::SendAttackPacket, this);
+    }
+    
+    Ptr<Socket> m_socket;
+    Address m_peer;
+    uint32_t m_packetSize;
+    DataRate m_attackRate;
+    bool m_running;
+    std::string m_attackType;
+};
+
+// ==================== 4. Defense Mechanisms ====================
+void InstallRateLimiting(Ptr<Node> router, NetDeviceContainer devices, 
+                         DataRate maxRate) {
+    TrafficControlHelper tch;
+    
+    // Token Bucket Filter for rate limiting
+    tch.SetRootQueueDisc("ns3::TbfQueueDisc",
+                         "MaxSize", StringValue("1000p"),
+                         "Burst", UintegerValue(10000),
+                         "Mtu", UintegerValue(1500),
+                         "Rate", DataRateValue(maxRate),
+                         "PeakRate", DataRateValue(maxRate));
+    
+    tch.Install(devices);
+    NS_LOG_INFO("Rate limiting installed: " << maxRate);
+}
+
+void InstallAclBlocking(Ptr<Node> router, std::vector<Ipv4Address> blacklist) {
+    Ptr<Ipv4> ipv4 = router->GetObject<Ipv4>();
+    Ptr<Ipv4StaticRouting> staticRouting = 
+        Ipv4RoutingHelper::GetRouting<Ipv4StaticRouting>(
+            ipv4->GetRoutingProtocol());
+    
+    // Block malicious IPs by routing to null interface
+    for (auto& ip : blacklist) {
+        staticRouting->AddHostRouteTo(ip, Ipv4Address("127.0.0.1"), 0);
+        NS_LOG_INFO("ACL: Blocked " << ip);
+    }
+}
+
+void InstallFairQueuing(Ptr<Node> router, NetDeviceContainer devices) {
+    TrafficControlHelper tch;
+    
+    // Fair Queue with CoDel for DDoS mitigation
+    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc",
+                         "MaxSize", StringValue("10240p"),
+                         "Flows", UintegerValue(1024),
+                         "DropBatchSize", UintegerValue(64),
+                         "Perturbation", UintegerValue(256));
+    
+    tch.Install(devices);
+    NS_LOG_INFO("Fair queuing with CoDel installed");
+}
+
+// Legitimate traffic receiver
+void ReceivePacket(Ptr<Socket> socket) {
+    Ptr<Packet> packet;
+    while ((packet = socket->Recv())) {
+        legitimatePacketsReceived++;
+    }
+}
+
+// ==================== Main Simulation ====================
+int main(int argc, char *argv[]) {
+    // Simulation parameters
+    bool enableIpsec = true;
+    bool enableEavesdropping = true;
+    bool enableDDoS = true;
+    bool enableRateLimiting = true;
+    bool enableAcl = false;
+    bool enableFairQueuing = true;
+    uint32_t numAttackers = 20;
+    double simTime = 60.0;
+    
+    CommandLine cmd;
+    cmd.AddValue("ipsec", "Enable IPsec", enableIpsec);
+    cmd.AddValue("eavesdrop", "Enable eavesdropping attack", enableEavesdropping);
+    cmd.AddValue("ddos", "Enable DDoS attack", enableDDoS);
+    cmd.AddValue("ratelimit", "Enable rate limiting", enableRateLimiting);
+    cmd.AddValue("acl", "Enable ACL blocking", enableAcl);
+    cmd.AddValue("fairqueue", "Enable fair queuing", enableFairQueuing);
+    cmd.AddValue("attackers", "Number of DDoS attackers", numAttackers);
+    cmd.AddValue("simtime", "Simulation time (seconds)", simTime);
+    cmd.Parse(argc, argv);
+    
+    LogComponentEnable("WanSecurityExercise", LOG_LEVEL_INFO);
+    
+    // ===== Create Network Topology =====
+    NS_LOG_INFO("Creating nodes...");
+    
+    // Main network nodes
+    NodeContainer clientNode, routerNode, serverNode;
+    clientNode.Create(1);   // n0 - legitimate client
+    routerNode.Create(1);   // n1 - WAN router
+    serverNode.Create(1);   // n2 - server
+    
+    // Attacker nodes
+    NodeContainer attackerNodes;
+    attackerNodes.Create(numAttackers);
+    
+    // Eavesdropper node (positioned on WAN link)
+    NodeContainer eavesdropperNode;
+    eavesdropperNode.Create(1);
+    
+    // ===== Install Internet Stack =====
+    InternetStackHelper stack;
+    stack.Install(clientNode);
+    stack.Install(routerNode);
+    stack.Install(serverNode);
+    stack.Install(attackerNodes);
+    stack.Install(eavesdropperNode);
+    
+    // ===== Create Links =====
+    PointToPointHelper p2p;
+    
+    // Client to Router (LAN link - high speed)
+    p2p.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2p.SetChannelAttribute("Delay", StringValue("2ms"));
+    NetDeviceContainer d0d1 = p2p.Install(clientNode.Get(0), routerNode.Get(0));
+    
+    // Router to Server (WAN link - lower speed, higher latency)
+    p2p.SetDeviceAttribute("DataRate", StringValue("50Mbps"));
+    p2p.SetChannelAttribute("Delay", StringValue("20ms"));
+    NetDeviceContainer d1d2 = p2p.Install(routerNode.Get(0), serverNode.Get(0));
+    
+    // Attackers to Router (simulating distributed attack sources)
+    NetDeviceContainer attackerDevices;
+    p2p.SetDeviceAttribute("DataRate", StringValue("10Mbps"));
+    p2p.SetChannelAttribute("Delay", StringValue("10ms"));
+    for (uint32_t i = 0; i < numAttackers; i++) {
+        NetDeviceContainer link = p2p.Install(attackerNodes.Get(i), routerNode.Get(0));
+        attackerDevices.Add(link.Get(0));
+    }
+    
+    // Eavesdropper connection (tap on WAN link for monitoring)
+    p2p.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2p.SetChannelAttribute("Delay", StringValue("1ms"));
+    NetDeviceContainer eavesdropLink = p2p.Install(eavesdropperNode.Get(0), 
+                                                    routerNode.Get(0));
+    
+    // ===== Assign IP Addresses =====
+    Ipv4AddressHelper address;
+    
+    // Client-Router subnet
+    address.SetBase("10.1.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer i0i1 = address.Assign(d0d1);
+    
+    // Router-Server subnet (WAN)
+    address.SetBase("10.1.2.0", "255.255.255.0");
+    Ipv4InterfaceContainer i1i2 = address.Assign(d1d2);
+    
+    // Attacker subnets
+    Ipv4InterfaceContainer attackerInterfaces;
+    for (uint32_t i = 0; i < numAttackers; i++) {
+        std::ostringstream subnet;
+        subnet << "10.2." << (i + 1) << ".0";
+        address.SetBase(subnet.str().c_str(), "255.255.255.0");
+        
+        NetDeviceContainer link;
+        link.Add(attackerDevices.Get(i));
+        link.Add(routerNode.Get(0)->GetDevice(i + 2));
+        
+        Ipv4InterfaceContainer iface = address.Assign(link);
+        attackerInterfaces.Add(iface.Get(0));
+    }
+    
+    // Eavesdropper subnet
+    address.SetBase("10.3.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer eavesdropIface = address.Assign(eavesdropLink);
+    
+    // Enable routing
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+    
+    // ===== 4. Install Defense Mechanisms =====
+    if (enableRateLimiting) {
+        NS_LOG_INFO("\n=== Installing Rate Limiting ===");
+        NetDeviceContainer routerDevices;
+        routerDevices.Add(d1d2.Get(0)); // Router's WAN interface
+        InstallRateLimiting(routerNode.Get(0), routerDevices, DataRate("40Mbps"));
+    }
+    
+    if (enableFairQueuing) {
+        NS_LOG_INFO("\n=== Installing Fair Queuing ===");
+        NetDeviceContainer routerDevices;
+        routerDevices.Add(d1d2.Get(0));
+        InstallFairQueuing(routerNode.Get(0), routerDevices);
+    }
+    
+    if (enableAcl) {
+        NS_LOG_INFO("\n=== Installing ACL Blocking ===");
+        std::vector<Ipv4Address> blacklist;
+        // Block first 5 attackers as example
+        for (uint32_t i = 0; i < std::min(5u, numAttackers); i++) {
+            blacklist.push_back(attackerInterfaces.GetAddress(i));
+        }
+        InstallAclBlocking(routerNode.Get(0), blacklist);
+    }
+    
+    // ===== 1. Setup Legitimate Traffic with IPsec =====
+    NS_LOG_INFO("\n=== Setting up Legitimate Traffic (IPsec: " 
+                << (enableIpsec ? "ENABLED" : "DISABLED") << ") ===");
+    
+    uint16_t port = 9;
+    
+    // Server application
+    PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
+                                InetSocketAddress(Ipv4Address::GetAny(), port));
+    ApplicationContainer serverApp = sinkHelper.Install(serverNode.Get(0));
+    serverApp.Start(Seconds(1.0));
+    serverApp.Stop(Seconds(simTime));
+    
+    // Get socket and connect callback
+    Ptr<PacketSink> sink = DynamicCast<PacketSink>(serverApp.Get(0));
+    Ptr<Socket> recvSocket = Socket::CreateSocket(serverNode.Get(0), 
+                                                   UdpSocketFactory::GetTypeId());
+    recvSocket->Bind(InetSocketAddress(Ipv4Address::GetAny(), port));
+    recvSocket->SetRecvCallback(MakeCallback(&ReceivePacket));
+    
+    // Client application with IPsec
+    Ptr<IpsecApplication> clientApp = CreateObject<IpsecApplication>();
+    clientApp->Setup(InetSocketAddress(i1i2.GetAddress(1), port),
+                     1024, 1000, DataRate("5Mbps"), enableIpsec);
+    clientNode.Get(0)->AddApplication(clientApp);
+    clientApp->SetStartTime(Seconds(2.0));
+    clientApp->SetStopTime(Seconds(simTime));
+    
+    // ===== 2. Setup Eavesdropping Attack =====
+    if (enableEavesdropping) {
+        NS_LOG_INFO("\n=== Setting up Eavesdropping Attack ===");
+        SetupEavesdropping(eavesdropperNode.Get(0), eavesdropLink.Get(0));
+    }
+    
+    // ===== 3. Setup DDoS Attack =====
+    if (enableDDoS) {
+        NS_LOG_INFO("\n=== Setting up DDoS Attack with " << numAttackers 
+                    << " attackers ===");
+        
+        for (uint32_t i = 0; i < numAttackers; i++) {
+            Ptr<DDoSAttacker> attacker = CreateObject<DDoSAttacker>();
+            std::string attackType = (i % 2 == 0) ? "UDP_FLOOD" : "SYN_FLOOD";
+            attacker->Setup(InetSocketAddress(i1i2.GetAddress(1), port),
+                           512, DataRate("5Mbps"), attackType);
+            attackerNodes.Get(i)->AddApplication(attacker);
+            attacker->SetStartTime(Seconds(5.0 + i * 0.1)); // Staggered start
+            attacker->SetStopTime(Seconds(simTime));
+        }
+    }
+    
+    // ===== Install Flow Monitor =====
+    FlowMonitorHelper flowmon;
+    Ptr<FlowMonitor> monitor = flowmon.InstallAll();
+    
+    // ===== Run Simulation =====
+    NS_LOG_INFO("\n=== Starting Simulation for " << simTime << " seconds ===\n");
+    
+    Simulator::Stop(Seconds(simTime));
+    Simulator::Run();
+    
+    // ===== 5. Security vs Performance Analysis =====
+    NS_LOG_INFO("\n========================================");
+    NS_LOG_INFO("===== SIMULATION RESULTS ANALYSIS =====");
+    NS_LOG_INFO("========================================\n");
+    
+    // Eavesdropping statistics
+    if (enableEavesdropping) {
+        NS_LOG_INFO("--- Eavesdropping Attack Results ---");
+        NS_LOG_INFO("Packets sniffed by attacker: " << packetsSniffed);
+        NS_LOG_INFO("IPsec protection: " << (enableIpsec ? 
+                    "ENABLED (data encrypted)" : "DISABLED (data readable)"));
+    }
+    
+    // Legitimate traffic statistics
+    NS_LOG_INFO("\n--- Legitimate Traffic Statistics ---");
+    NS_LOG_INFO("Packets sent: " << legitimatePacketsSent);
+    NS_LOG_INFO("Packets received: " << legitimatePacketsReceived);
+    double deliveryRatio = (legitimatePacketsSent > 0) ? 
+        (legitimatePacketsReceived * 100.0 / legitimatePacketsSent) : 0;
+    NS_LOG_INFO("Delivery ratio: " << deliveryRatio << "%");
+    
+    // Flow Monitor statistics
+    NS_LOG_INFO("\n--- Flow Monitor Detailed Statistics ---");
+    monitor->CheckForLostPackets();
+    Ptr<Ipv4FlowClassifier> classifier = 
+        DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
+    std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
+    
+    double totalThroughput = 0;
+    double totalDelay = 0;
+    uint32_t flowCount = 0;
+    double legitimateFlowThroughput = 0;
+    double attackFlowThroughput = 0;
+    
+    for (auto& flow : stats) {
+        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flow.first);
+        
+        bool isLegitimate = (t.sourceAddress == i0i1.GetAddress(0));
+        
+        double throughput = flow.second.rxBytes * 8.0 / 
+                           (flow.second.timeLastRxPacket.GetSeconds() - 
+                            flow.second.timeFirstTxPacket.GetSeconds()) / 1000000.0;
+        
+        double avgDelay = (flow.second.rxPackets > 0) ?
+                         (flow.second.delaySum.GetMilliSeconds() / flow.second.rxPackets) : 0;
+        
+        if (isLegitimate) {
+            NS_LOG_INFO("\nLEGITIMATE Flow " << flow.first);
+            legitimateFlowThroughput += throughput;
+        } else {
+            attackFlowThroughput += throughput;
+        }
+        
+        NS_LOG_INFO("  " << t.sourceAddress << " -> " << t.destinationAddress);
+        NS_LOG_INFO("  Tx Packets: " << flow.second.txPackets);
+        NS_LOG_INFO("  Rx Packets: " << flow.second.rxPackets);
+        NS_LOG_INFO("  Lost Packets: " << flow.second.lostPackets);
+        NS_LOG_INFO("  Throughput: " << throughput << " Mbps");
+        NS_LOG_INFO("  Avg Delay: " << avgDelay << " ms");
+        
+        totalThroughput += throughput;
+        totalDelay += avgDelay;
+        flowCount++;
+    }
+    
+    // ===== Performance Trade-off Analysis =====
+    NS_LOG_INFO("\n========================================");
+    NS_LOG_INFO("=== SECURITY vs PERFORMANCE TRADE-OFF ===");
+    NS_LOG_INFO("========================================\n");
+    
+    NS_LOG_INFO("Configuration:");
+    NS_LOG_INFO("  IPsec: " << (enableIpsec ? "ENABLED" : "DISABLED"));
+    NS_LOG_INFO("  Rate Limiting: " << (enableRateLimiting ? "ENABLED" : "DISABLED"));
+    NS_LOG_INFO("  ACL Blocking: " << (enableAcl ? "ENABLED" : "DISABLED"));
+    NS_LOG_INFO("  Fair Queuing: " << (enableFairQueuing ? "ENABLED" : "DISABLED"));
+    NS_LOG_INFO("  DDoS Attack: " << (enableDDoS ? "ENABLED" : "DISABLED") 
+                << " (" << numAttackers << " attackers)");
+    
+    NS_LOG_INFO("\nPerformance Metrics:");
+    NS_LOG_INFO("  Total Throughput: " << totalThroughput << " Mbps");
+    NS_LOG_INFO("  Legitimate Traffic Throughput: " << legitimateFlowThroughput << " Mbps");
+    NS_LOG_INFO("  Attack Traffic Throughput: " << attackFlowThroughput << " Mbps");
+    NS_LOG_INFO("  Average Delay: " << (flowCount > 0 ? totalDelay/flowCount : 0) << " ms");
+    NS_LOG_INFO("  Legitimate Delivery Ratio: " << deliveryRatio << "%");
+    
+    if (enableIpsec) {
+        NS_LOG_INFO("\nIPsec Impact:");
+        NS_LOG_INFO("  Expected throughput reduction: ~10-15%");
+        NS_LOG_INFO("  Expected latency increase: ~2-5ms");
+        NS_LOG_INFO("  Security benefit: Complete payload encryption");
+    }
+    
+    if (enableDDoS && (enableRateLimiting || enableFairQueuing)) {
+        double protectionEffectiveness = (deliveryRatio > 50) ? 
+            ((deliveryRatio - 50) * 2) : deliveryRatio;
+        NS_LOG_INFO("\nDDoS Protection Effectiveness:");
+        NS_LOG_INFO("  Legitimate traffic preserved: " << protectionEffectiveness << "%");
+        NS_LOG_INFO("  Attack mitigation success: " << 
+                    (deliveryRatio > 60 ? "GOOD" : 
+                     deliveryRatio > 40 ? "MODERATE" : "POOR"));
+    }
+    
+    NS_LOG_INFO("\n========================================");
+    NS_LOG_INFO("Recommendation: " << (deliveryRatio > 70 ? 
+                "Current protection adequate" : 
+                "Consider stronger defenses or multiple layers"));
+    NS_LOG_INFO("========================================\n");
+    
+    // Export to XML for further analysis
+    monitor->SerializeToXmlFile("wan-security-results.xml", true, true);
+    
+    Simulator::Destroy();
+    
+    return 0;
+}

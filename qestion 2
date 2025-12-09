@@ -1,0 +1,320 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+/*
+ * QoS Implementation for Mixed Traffic (VoIP + FTP)
+ * Exercise 2: Quality of Service Implementation for Mixed Traffic
+ * 
+ * This simulation demonstrates priority queuing to protect VoIP traffic
+ * from bulk FTP transfers over a WAN link.
+ */
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/traffic-control-module.h"
+#include "ns3/flow-monitor-module.h"
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("QoSMixedTrafficSimulation");
+
+// Global variables for statistics
+std::map<FlowId, std::string> flowTypes; // Track which flow is VoIP or FTP
+
+// Function to print statistics
+void PrintStatistics(Ptr<FlowMonitor> monitor, FlowMonitorHelper &flowmon) {
+    monitor->CheckForLostPackets();
+    Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
+    std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
+
+    // Separate statistics for VoIP and FTP
+    double voipTotalDelay = 0, voipTotalJitter = 0, voipTotalLoss = 0;
+    double ftpTotalDelay = 0, ftpTotalJitter = 0, ftpTotalLoss = 0;
+    uint32_t voipFlows = 0, ftpFlows = 0;
+    double voipTotalRx = 0, ftpTotalRx = 0;
+    double voipTotalTx = 0, ftpTotalTx = 0;
+
+    std::cout << "\n========================================\n";
+    std::cout << "      FLOW STATISTICS\n";
+    std::cout << "========================================\n\n";
+
+    for (auto iter = stats.begin(); iter != stats.end(); ++iter) {
+        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(iter->first);
+        
+        double delay = 0, jitter = 0, lossRate = 0;
+        
+        if (iter->second.rxPackets > 0) {
+            delay = iter->second.delaySum.GetSeconds() / iter->second.rxPackets * 1000; // ms
+        }
+        if (iter->second.rxPackets > 1) {
+            jitter = iter->second.jitterSum.GetSeconds() / (iter->second.rxPackets - 1) * 1000; // ms
+        }
+        if (iter->second.txPackets > 0) {
+            lossRate = (double)iter->second.lostPackets / iter->second.txPackets * 100; // %
+        }
+
+        double throughput = iter->second.rxBytes * 8.0 / 
+                          (iter->second.timeLastRxPacket.GetSeconds() - 
+                           iter->second.timeFirstTxPacket.GetSeconds()) / 1000; // kbps
+
+        // Determine traffic type by destination port
+        std::string trafficType;
+        if (t.destinationPort >= 5000 && t.destinationPort < 5010) {
+            trafficType = "VoIP";
+            voipTotalDelay += delay * iter->second.rxPackets;
+            voipTotalJitter += jitter * (iter->second.rxPackets > 1 ? iter->second.rxPackets - 1 : 1);
+            voipTotalLoss += iter->second.lostPackets;
+            voipTotalRx += iter->second.rxPackets;
+            voipTotalTx += iter->second.txPackets;
+            voipFlows++;
+        } else {
+            trafficType = "FTP ";
+            ftpTotalDelay += delay * iter->second.rxPackets;
+            ftpTotalJitter += jitter * (iter->second.rxPackets > 1 ? iter->second.rxPackets - 1 : 1);
+            ftpTotalLoss += iter->second.lostPackets;
+            ftpTotalRx += iter->second.rxPackets;
+            ftpTotalTx += iter->second.txPackets;
+            ftpFlows++;
+        }
+
+        std::cout << "Flow " << iter->first << " (" << trafficType << ") " 
+                  << t.sourceAddress << ":" << t.sourcePort << " -> " 
+                  << t.destinationAddress << ":" << t.destinationPort << "\n";
+        std::cout << "  Tx Packets: " << iter->second.txPackets << "\n";
+        std::cout << "  Rx Packets: " << iter->second.rxPackets << "\n";
+        std::cout << "  Lost Packets: " << iter->second.lostPackets 
+                  << " (" << lossRate << "%)\n";
+        std::cout << "  Avg Delay: " << delay << " ms\n";
+        std::cout << "  Avg Jitter: " << jitter << " ms\n";
+        std::cout << "  Throughput: " << throughput << " kbps\n\n";
+    }
+
+    // Print summary statistics
+    std::cout << "========================================\n";
+    std::cout << "      SUMMARY STATISTICS\n";
+    std::cout << "========================================\n\n";
+
+    if (voipFlows > 0 && voipTotalRx > 0) {
+        std::cout << "VoIP Traffic (Class 1):\n";
+        std::cout << "  Total Flows: " << voipFlows << "\n";
+        std::cout << "  Avg Delay: " << (voipTotalDelay / voipTotalRx) << " ms\n";
+        std::cout << "  Avg Jitter: " << (voipTotalJitter / (voipTotalRx - voipFlows)) << " ms\n";
+        std::cout << "  Packet Loss Rate: " << (voipTotalLoss / voipTotalTx * 100) << " %\n\n";
+    }
+
+    if (ftpFlows > 0 && ftpTotalRx > 0) {
+        std::cout << "FTP Traffic (Class 2):\n";
+        std::cout << "  Total Flows: " << ftpFlows << "\n";
+        std::cout << "  Avg Delay: " << (ftpTotalDelay / ftpTotalRx) << " ms\n";
+        std::cout << "  Avg Jitter: " << (ftpTotalJitter / (ftpTotalRx - ftpFlows)) << " ms\n";
+        std::cout << "  Packet Loss Rate: " << (ftpTotalLoss / ftpTotalTx * 100) << " %\n\n";
+    }
+
+    std::cout << "========================================\n\n";
+}
+
+int main(int argc, char *argv[]) {
+    // Configuration parameters
+    bool enableQoS = true;
+    uint32_t numVoipFlows = 5;
+    uint32_t numFtpFlows = 3;
+    double simulationTime = 30.0; // seconds
+    std::string bottleneckDataRate = "5Mbps";
+    std::string bottleneckDelay = "20ms";
+
+    // Command line arguments
+    CommandLine cmd;
+    cmd.AddValue("enableQoS", "Enable QoS (true/false)", enableQoS);
+    cmd.AddValue("voipFlows", "Number of VoIP flows", numVoipFlows);
+    cmd.AddValue("ftpFlows", "Number of FTP flows", numFtpFlows);
+    cmd.AddValue("simTime", "Simulation time in seconds", simulationTime);
+    cmd.Parse(argc, argv);
+
+    // Enable logging
+    LogComponentEnable("QoSMixedTrafficSimulation", LOG_LEVEL_INFO);
+
+    std::cout << "\n========================================\n";
+    std::cout << "  QoS Mixed Traffic Simulation\n";
+    std::cout << "========================================\n";
+    std::cout << "Configuration:\n";
+    std::cout << "  QoS Enabled: " << (enableQoS ? "YES" : "NO") << "\n";
+    std::cout << "  VoIP Flows: " << numVoipFlows << "\n";
+    std::cout << "  FTP Flows: " << numFtpFlows << "\n";
+    std::cout << "  Bottleneck: " << bottleneckDataRate << ", " << bottleneckDelay << "\n";
+    std::cout << "  Simulation Time: " << simulationTime << " seconds\n";
+    std::cout << "========================================\n\n";
+
+    // Create nodes
+    NodeContainer voipClients, ftpClients;
+    voipClients.Create(numVoipFlows);
+    ftpClients.Create(numFtpFlows);
+    
+    NodeContainer routers;
+    routers.Create(2); // R1 and R2
+    
+    NodeContainer servers;
+    servers.Create(1);
+
+    // Create point-to-point links
+    PointToPointHelper accessLink;
+    accessLink.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    accessLink.SetChannelAttribute("Delay", StringValue("2ms"));
+
+    PointToPointHelper bottleneckLink;
+    bottleneckLink.SetDeviceAttribute("DataRate", StringValue(bottleneckDataRate));
+    bottleneckLink.SetChannelAttribute("Delay", StringValue(bottleneckDelay));
+
+    // Install Internet stack
+    InternetStackHelper stack;
+    stack.Install(voipClients);
+    stack.Install(ftpClients);
+    stack.Install(routers);
+    stack.Install(servers);
+
+    // Setup Traffic Control (QoS)
+    TrafficControlHelper tch;
+    if (enableQoS) {
+        // Configure PrioQueueDisc with 2 bands
+        tch.SetRootQueueDisc("ns3::PrioQueueDisc", 
+                            "Priomap", StringValue("1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"));
+        
+        // Configure internal queues
+        tch.SetQueueLimits("ns3::DynamicQueueLimits");
+        
+        Config::SetDefault("ns3::PfifoFastQueueDisc::MaxSize", 
+                          QueueSizeValue(QueueSize("50p"))); // Band 0: VoIP
+    }
+
+    // Create network topology
+    Ipv4AddressHelper address;
+    NetDeviceContainer devices;
+    Ipv4InterfaceContainer interfaces;
+
+    // Connect VoIP clients to R1
+    address.SetBase("10.1.1.0", "255.255.255.0");
+    for (uint32_t i = 0; i < numVoipFlows; i++) {
+        devices = accessLink.Install(voipClients.Get(i), routers.Get(0));
+        if (enableQoS) tch.Install(devices);
+        interfaces = address.Assign(devices);
+        address.NewNetwork();
+    }
+
+    // Connect FTP clients to R1
+    address.SetBase("10.2.1.0", "255.255.255.0");
+    for (uint32_t i = 0; i < numFtpFlows; i++) {
+        devices = accessLink.Install(ftpClients.Get(i), routers.Get(0));
+        if (enableQoS) tch.Install(devices);
+        interfaces = address.Assign(devices);
+        address.NewNetwork();
+    }
+
+    // Bottleneck link: R1 to R2
+    address.SetBase("10.100.100.0", "255.255.255.0");
+    devices = bottleneckLink.Install(routers.Get(0), routers.Get(1));
+    if (enableQoS) {
+        // This is where QoS matters most - apply to bottleneck
+        QueueDiscContainer qdiscs = tch.Install(devices);
+    }
+    interfaces = address.Assign(devices);
+
+    // Connect server to R2
+    address.SetBase("10.3.1.0", "255.255.255.0");
+    devices = accessLink.Install(routers.Get(1), servers.Get(0));
+    if (enableQoS) tch.Install(devices);
+    Ipv4InterfaceContainer serverInterface = address.Assign(devices);
+
+    // Enable routing
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    // Get server IP address
+    Ipv4Address serverAddr = serverInterface.GetAddress(1);
+
+    // Install VoIP applications (Class 1: High Priority)
+    uint16_t voipPort = 5000;
+    for (uint32_t i = 0; i < numVoipFlows; i++) {
+        // Server side
+        UdpServerHelper voipServer(voipPort + i);
+        ApplicationContainer serverApp = voipServer.Install(servers.Get(0));
+        serverApp.Start(Seconds(0.0));
+        serverApp.Stop(Seconds(simulationTime));
+
+        // Client side - VoIP traffic (160 bytes every 20ms = 64 kbps)
+        UdpClientHelper voipClient(serverAddr, voipPort + i);
+        voipClient.SetAttribute("MaxPackets", UintegerValue(4294967295u));
+        voipClient.SetAttribute("Interval", TimeValue(MilliSeconds(20)));
+        voipClient.SetAttribute("PacketSize", UintegerValue(160));
+        
+        // Set DSCP to EF (Expedited Forwarding) = 46 = 0xB8 in ToS field
+        voipClient.SetAttribute("Tos", UintegerValue(0xB8)); // EF: 46 << 2
+        
+        ApplicationContainer clientApp = voipClient.Install(voipClients.Get(i));
+        clientApp.Start(Seconds(1.0));
+        clientApp.Stop(Seconds(simulationTime));
+    }
+
+    // Install FTP applications (Class 2: Best Effort)
+    uint16_t ftpPort = 6000;
+    for (uint32_t i = 0; i < numFtpFlows; i++) {
+        // Server side - sink
+        PacketSinkHelper ftpSink("ns3::TcpSocketFactory", 
+                                 InetSocketAddress(Ipv4Address::GetAny(), ftpPort + i));
+        ApplicationContainer sinkApp = ftpSink.Install(servers.Get(0));
+        sinkApp.Start(Seconds(0.0));
+        sinkApp.Stop(Seconds(simulationTime));
+
+        // Client side - bulk send (FTP-like)
+        BulkSendHelper ftpClient("ns3::TcpSocketFactory",
+                                InetSocketAddress(serverAddr, ftpPort + i));
+        ftpClient.SetAttribute("MaxBytes", UintegerValue(0)); // Unlimited
+        ftpClient.SetAttribute("SendSize", UintegerValue(1500));
+        
+        // Set DSCP to Best Effort = 0
+        ftpClient.SetAttribute("Tos", UintegerValue(0x00));
+        
+        ApplicationContainer clientApp = ftpClient.Install(ftpClients.Get(i));
+        
+        // Staggered start times to create progressive congestion
+        double startTime = 2.0 + (i * 3.0); // 2s, 5s, 8s
+        clientApp.Start(Seconds(startTime));
+        clientApp.Stop(Seconds(20.0));
+        
+        std::cout << "FTP Flow " << i << " starts at " << startTime << "s\n";
+    }
+
+    std::cout << "\n========================================\n";
+    std::cout << "  Simulation Timeline:\n";
+    std::cout << "========================================\n";
+    std::cout << "  1.0s: Start all VoIP flows\n";
+    std::cout << "  2.0s: Start FTP flow 1\n";
+    std::cout << "  5.0s: Start FTP flow 2 (congestion begins)\n";
+    std::cout << "  8.0s: Start FTP flow 3 (heavy congestion)\n";
+    std::cout << "  20.0s: Stop all FTP flows\n";
+    std::cout << "  " << simulationTime << "s: End simulation\n";
+    std::cout << "========================================\n\n";
+
+    // Install FlowMonitor
+    FlowMonitorHelper flowmon;
+    Ptr<FlowMonitor> monitor = flowmon.InstallAll();
+
+    // Run simulation
+    std::cout << "Starting simulation...\n\n";
+    Simulator::Stop(Seconds(simulationTime));
+    Simulator::Run();
+
+    // Print statistics
+    PrintStatistics(monitor, flowmon);
+
+    // Generate FlowMonitor XML output
+    std::string xmlFile = enableQoS ? "qos-enabled.xml" : "qos-disabled.xml";
+    monitor->SerializeToXmlFile(xmlFile, true, true);
+    std::cout << "FlowMonitor results saved to: " << xmlFile << "\n";
+
+    Simulator::Destroy();
+
+    std::cout << "\n========================================\n";
+    std::cout << "Simulation completed successfully!\n";
+    std::cout << "========================================\n\n";
+
+    return 0;
+}

@@ -1,0 +1,321 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+/*
+ * Multi-Hop WAN Architecture with Fault Tolerance
+ * 
+ * Topology:
+ *   Branch-C (10.1.1.1) --- Network1 --- DC-A (10.1.1.2)
+ *                                         |           |
+ *                                    Network2    Network3
+ *                                      (primary)  (backup)
+ *                                         |           |
+ *                                      DR-B (10.1.2.2 & 10.1.3.2)
+ */
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/flow-monitor-module.h"
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("MultiHopWanSimulation");
+
+// Global variables for statistics
+uint32_t g_txPackets = 0;
+uint32_t g_rxPackets = 0;
+uint32_t g_droppedPackets = 0;
+std::vector<double> g_delays;
+bool g_linkFailed = false;
+
+// Callback functions for packet tracking
+void TxCallback(Ptr<const Packet> packet)
+{
+  g_txPackets++;
+  NS_LOG_INFO("Packet transmitted at " << Simulator::Now().GetSeconds() << "s");
+}
+
+void RxCallback(Ptr<const Packet> packet, const Address &address)
+{
+  g_rxPackets++;
+  NS_LOG_INFO("Packet received at " << Simulator::Now().GetSeconds() << "s");
+}
+
+void PhyRxDropCallback(Ptr<const Packet> packet)
+{
+  g_droppedPackets++;
+  if (Simulator::Now().GetSeconds() >= 5.0)
+  {
+    NS_LOG_WARN("Packet DROPPED at " << Simulator::Now().GetSeconds() << "s (after failure)");
+  }
+}
+
+// Function to disable primary link
+void DisablePrimaryLink(Ptr<NetDevice> device1, Ptr<NetDevice> device2)
+{
+  NS_LOG_WARN("=== DISABLING PRIMARY LINK at " << Simulator::Now().GetSeconds() << "s ===");
+  device1->SetDown();
+  device2->SetDown();
+  g_linkFailed = true;
+}
+
+// Function to print statistics
+void PrintStatistics(Ptr<FlowMonitor> monitor, FlowMonitorHelper &flowHelper)
+{
+  monitor->CheckForLostPackets();
+  Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowHelper.GetClassifier());
+  std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
+
+  std::cout << "\n=== FLOW STATISTICS ===\n";
+  for (auto iter = stats.begin(); iter != stats.end(); ++iter)
+  {
+    Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(iter->first);
+    
+    std::cout << "\nFlow " << iter->first << " (" 
+              << t.sourceAddress << ":" << t.sourcePort << " -> " 
+              << t.destinationAddress << ":" << t.destinationPort << ")\n";
+    std::cout << "  Tx Packets: " << iter->second.txPackets << "\n";
+    std::cout << "  Rx Packets: " << iter->second.rxPackets << "\n";
+    std::cout << "  Lost Packets: " << iter->second.lostPackets << "\n";
+    std::cout << "  Packet Loss Rate: " 
+              << (iter->second.txPackets > 0 ? 
+                  100.0 * iter->second.lostPackets / iter->second.txPackets : 0) 
+              << "%\n";
+    
+    if (iter->second.rxPackets > 0)
+    {
+      double avgDelay = iter->second.delaySum.GetMilliSeconds() / iter->second.rxPackets;
+      std::cout << "  Average Delay: " << avgDelay << " ms\n";
+      std::cout << "  Average Jitter: " 
+                << iter->second.jitterSum.GetMilliSeconds() / (iter->second.rxPackets - 1) 
+                << " ms\n";
+      
+      double throughput = iter->second.rxBytes * 8.0 / 
+                         (iter->second.timeLastRxPacket.GetSeconds() - 
+                          iter->second.timeFirstTxPacket.GetSeconds()) / 1000;
+      std::cout << "  Throughput: " << throughput << " kbps\n";
+    }
+  }
+}
+
+int main(int argc, char *argv[])
+{
+  // Command line parameters
+  bool useStaticRouting = true;
+  double simulationTime = 20.0;
+  uint32_t packetSize = 1024;
+  std::string dataRate = "500kb/s";
+  
+  CommandLine cmd;
+  cmd.AddValue("static", "Use static routing (true) or dynamic (false)", useStaticRouting);
+  cmd.AddValue("time", "Simulation time in seconds", simulationTime);
+  cmd.AddValue("size", "Packet size in bytes", packetSize);
+  cmd.AddValue("rate", "Data rate", dataRate);
+  cmd.Parse(argc, argv);
+
+  // Enable logging
+  LogComponentEnable("MultiHopWanSimulation", LOG_LEVEL_INFO);
+
+  NS_LOG_INFO("Creating Topology...");
+
+  // Create nodes
+  NodeContainer nodes;
+  nodes.Create(3);
+  
+  Ptr<Node> branchC = nodes.Get(0);
+  Ptr<Node> dcA = nodes.Get(1);
+  Ptr<Node> drB = nodes.Get(2);
+
+  // Create point-to-point links
+  PointToPointHelper p2p;
+  
+  // Network1: Branch-C to DC-A
+  p2p.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+  p2p.SetChannelAttribute("Delay", StringValue("10ms"));
+  NetDeviceContainer net1Devices = p2p.Install(branchC, dcA);
+
+  // Network2: DC-A to DR-B (Primary path)
+  p2p.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+  p2p.SetChannelAttribute("Delay", StringValue("20ms"));
+  NetDeviceContainer net2Devices = p2p.Install(dcA, drB);
+
+  // Network3: DC-A to DR-B (Backup path)
+  p2p.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+  p2p.SetChannelAttribute("Delay", StringValue("30ms"));
+  NetDeviceContainer net3Devices = p2p.Install(dcA, drB);
+
+  // Install Internet stack
+  InternetStackHelper stack;
+  
+  if (useStaticRouting)
+  {
+    NS_LOG_INFO("Using STATIC ROUTING");
+    stack.Install(nodes);
+  }
+  else
+  {
+    NS_LOG_INFO("Using DYNAMIC ROUTING (Global Routing)");
+    // Use Ipv4GlobalRoutingHelper for dynamic routing simulation
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+    stack.Install(nodes);
+  }
+
+  // Assign IP addresses
+  Ipv4AddressHelper address;
+  
+  // Network1: 10.1.1.0/24
+  address.SetBase("10.1.1.0", "255.255.255.0");
+  Ipv4InterfaceContainer net1Interfaces = address.Assign(net1Devices);
+  
+  // Network2: 10.1.2.0/24 (Primary)
+  address.SetBase("10.1.2.0", "255.255.255.0");
+  Ipv4InterfaceContainer net2Interfaces = address.Assign(net2Devices);
+  
+  // Network3: 10.1.3.0/24 (Backup)
+  address.SetBase("10.1.3.0", "255.255.255.0");
+  Ipv4InterfaceContainer net3Interfaces = address.Assign(net3Devices);
+
+  NS_LOG_INFO("Configuring Static Routes...");
+  
+  if (useStaticRouting)
+  {
+    // Configure static routing
+    Ipv4StaticRoutingHelper staticRoutingHelper;
+    
+    // Branch-C routing
+    Ptr<Ipv4StaticRouting> branchCRouting = staticRoutingHelper.GetStaticRouting(
+        branchC->GetObject<Ipv4>());
+    branchCRouting->AddHostRouteTo(Ipv4Address("10.1.2.2"), 
+                                   Ipv4Address("10.1.1.2"), 1, 10);
+    branchCRouting->AddHostRouteTo(Ipv4Address("10.1.3.2"), 
+                                   Ipv4Address("10.1.1.2"), 1, 20);
+    
+    // DC-A routing
+    Ptr<Ipv4StaticRouting> dcARouting = staticRoutingHelper.GetStaticRouting(
+        dcA->GetObject<Ipv4>());
+    // Primary route to DR-B via Network2 (interface 2)
+    dcARouting->AddHostRouteTo(Ipv4Address("10.1.2.2"), 2, 10);
+    // Backup route to DR-B via Network3 (interface 3)
+    dcARouting->AddHostRouteTo(Ipv4Address("10.1.3.2"), 3, 20);
+    // Route back to Branch-C
+    dcARouting->AddHostRouteTo(Ipv4Address("10.1.1.1"), 1, 10);
+    
+    // DR-B routing
+    Ptr<Ipv4StaticRouting> drBRouting = staticRoutingHelper.GetStaticRouting(
+        drB->GetObject<Ipv4>());
+    // Primary route back via Network2 (interface 1)
+    drBRouting->AddHostRouteTo(Ipv4Address("10.1.1.1"), 
+                               Ipv4Address("10.1.2.1"), 1, 10);
+    // Backup route via Network3 (interface 2)
+    drBRouting->AddHostRouteTo(Ipv4Address("10.1.1.1"), 
+                               Ipv4Address("10.1.3.1"), 2, 20);
+  }
+  else
+  {
+    // Populate global routing tables
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+  }
+
+  // Print routing tables
+  NS_LOG_INFO("\n=== INITIAL ROUTING TABLES ===");
+  Ipv4GlobalRoutingHelper::PrintRoutingTableAllAt(Seconds(1.0), 
+      Create<OutputStreamWrapper>(&std::cout));
+
+  // Install applications
+  NS_LOG_INFO("Installing Applications...");
+  
+  // UDP Echo Server on DR-B
+  uint16_t port = 9;
+  UdpEchoServerHelper server(port);
+  ApplicationContainer serverApps = server.Install(drB);
+  serverApps.Start(Seconds(0.0));
+  serverApps.Stop(Seconds(simulationTime));
+
+  // UDP Echo Client on Branch-C
+  UdpEchoClientHelper client(Ipv4Address("10.1.2.2"), port);
+  client.SetAttribute("MaxPackets", UintegerValue(10000));
+  client.SetAttribute("Interval", TimeValue(Seconds(0.1)));
+  client.SetAttribute("PacketSize", UintegerValue(packetSize));
+  
+  ApplicationContainer clientApps = client.Install(branchC);
+  clientApps.Start(Seconds(1.0));
+  clientApps.Stop(Seconds(simulationTime - 1.0));
+
+  // Install FlowMonitor
+  FlowMonitorHelper flowHelper;
+  Ptr<FlowMonitor> monitor = flowHelper.InstallAll();
+
+  // Connect trace sources
+  Ptr<UdpEchoClient> echoClient = DynamicCast<UdpEchoClient>(clientApps.Get(0));
+  if (echoClient != nullptr)
+  {
+    echoClient->TraceConnectWithoutContext("Tx", MakeCallback(&TxCallback));
+  }
+  
+  Ptr<UdpEchoServer> echoServer = DynamicCast<UdpEchoServer>(serverApps.Get(0));
+  if (echoServer != nullptr)
+  {
+    echoServer->TraceConnectWithoutContext("Rx", MakeCallback(&RxCallback));
+  }
+
+  // Connect drop trace
+  Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::PointToPointNetDevice/PhyRxDrop",
+                                MakeCallback(&PhyRxDropCallback));
+
+  // Schedule link failure at t=5 seconds
+  NS_LOG_INFO("Scheduling link failure at t=5.0s");
+  Ptr<NetDevice> dcaPrimaryDevice = dcA->GetDevice(2); // Network2 on DC-A
+  Ptr<NetDevice> drbPrimaryDevice = drB->GetDevice(1); // Network2 on DR-B
+  
+  Simulator::Schedule(Seconds(5.0), &DisablePrimaryLink, 
+                     dcaPrimaryDevice, drbPrimaryDevice);
+
+  // Print intermediate statistics
+  Simulator::Schedule(Seconds(4.5), []() {
+    std::cout << "\n=== STATISTICS BEFORE FAILURE (t=4.5s) ===\n";
+    std::cout << "Packets Transmitted: " << g_txPackets << "\n";
+    std::cout << "Packets Received: " << g_rxPackets << "\n";
+    std::cout << "Packets Dropped: " << g_droppedPackets << "\n";
+    std::cout << "Packet Loss Rate: " 
+              << (g_txPackets > 0 ? 100.0 * (g_txPackets - g_rxPackets) / g_txPackets : 0) 
+              << "%\n";
+  });
+
+  Simulator::Schedule(Seconds(10.0), []() {
+    std::cout << "\n=== STATISTICS AFTER FAILURE (t=10.0s) ===\n";
+    std::cout << "Packets Transmitted: " << g_txPackets << "\n";
+    std::cout << "Packets Received: " << g_rxPackets << "\n";
+    std::cout << "Packets Dropped: " << g_droppedPackets << "\n";
+    std::cout << "Packet Loss Rate: " 
+              << (g_txPackets > 0 ? 100.0 * (g_txPackets - g_rxPackets) / g_txPackets : 0) 
+              << "%\n";
+  });
+
+  // Enable pcap tracing (optional)
+  // p2p.EnablePcapAll("multi-hop-wan");
+
+  NS_LOG_INFO("Starting Simulation...");
+  Simulator::Stop(Seconds(simulationTime));
+  Simulator::Run();
+
+  // Final statistics
+  std::cout << "\n=== FINAL STATISTICS (t=" << simulationTime << "s) ===\n";
+  std::cout << "Total Packets Transmitted: " << g_txPackets << "\n";
+  std::cout << "Total Packets Received: " << g_rxPackets << "\n";
+  std::cout << "Total Packets Dropped: " << g_droppedPackets << "\n";
+  std::cout << "Overall Packet Loss Rate: " 
+            << (g_txPackets > 0 ? 100.0 * (g_txPackets - g_rxPackets) / g_txPackets : 0) 
+            << "%\n";
+
+  // Print FlowMonitor statistics
+  PrintStatistics(monitor, flowHelper);
+
+  // Serialize FlowMonitor results to XML
+  monitor->SerializeToXmlFile("multi-hop-wan-flowmon.xml", true, true);
+
+  Simulator::Destroy();
+  NS_LOG_INFO("Simulation Completed Successfully!");
+
+  return 0;
+}
